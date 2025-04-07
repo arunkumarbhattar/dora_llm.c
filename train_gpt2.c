@@ -28,6 +28,182 @@ There will be other versions of this code that specialize it and make it fast.
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
 
+typedef struct {
+    float* magnitude; // magnitude vector (trainable)
+    float* A;         // low-rank matrix A
+    float* B;         // low-rank matrix B
+    float alpha;      // scaling factor
+    int rank;         // rank of the low-rank matrices
+    int in_dim;       // input dimension
+    int out_dim;      // output dimension
+} DoRALayer;
+
+DoRALayer construct_dora_layer(float* magnitude, float* A, float* B,
+                               int in_dim, int out_dim, int rank, float alpha) {
+    DoRALayer layer;
+    layer.magnitude = magnitude;
+    layer.A = A;
+    layer.B = B;
+    layer.in_dim = in_dim;
+    layer.out_dim = out_dim;
+    layer.rank = rank;
+    layer.alpha = alpha;
+    return layer;
+}
+
+void dora_init(DoRALayer* layer, int in_dim, int out_dim, int rank, float alpha, float* pretrained_weight) {
+    layer->in_dim = in_dim;
+    layer->out_dim = out_dim;
+    layer->rank = rank;
+
+    // Don't allocate new memory - use the pointers already in the structure
+    // layer->magnitude should already point to allocated memory
+
+    // Calculate the norm (magnitude) for each output dimension
+    for (int i = 0; i < out_dim; i++) {
+        float sum_squared = 0.0f;
+        for (int j = 0; j < in_dim; j++) {
+            float val = pretrained_weight[i * in_dim + j];
+            sum_squared += val * val;
+        }
+
+        layer->magnitude[i] = sqrtf(sum_squared);
+        // Ensure magnitude is not too small to prevent division by zero
+        if (layer->magnitude[i] < 1e-6f) {
+            layer->magnitude[i] = 1e-6f;
+        }
+    }
+
+    // Initialize A and B with small random values
+    float std_dev = 1.0f / sqrtf(rank);
+    for (int i = 0; i < in_dim; i++) {
+        for (int r = 0; r < rank; r++) {
+            layer->A[i * rank + r] = (2.0f * ((float)rand() / RAND_MAX) - 1.0f) * std_dev;
+        }
+    }
+
+    for (int r = 0; r < rank; r++) {
+        for (int o = 0; o < out_dim; o++) {
+            layer->B[r * out_dim + o] = (2.0f * ((float)rand() / RAND_MAX) - 1.0f) * std_dev;
+        }
+    }
+
+    // Scale alpha by 1/sqrt(rank) for stability
+    layer->alpha = alpha / sqrtf(rank);
+}
+
+void dora_forward(float* output, float* input, DoRALayer* layer, float* pretrained_weight) {
+    // Check that the DoRALayer is properly initialized.
+    if (!layer || !layer->magnitude || !layer->A || !layer->B || !pretrained_weight) {
+        fprintf(stderr, "dora_forward: Invalid pointers passed to function.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    int in_dim = layer->in_dim;
+    int out_dim = layer->out_dim;
+    int rank = layer->rank;
+
+    // Allocate memory for the directional component.
+    float* direction = (float*)mallocCheck(in_dim * out_dim * sizeof(float));
+
+    // Compute directional component: each row of pretrained_weight is divided by the corresponding magnitude.
+    for (int i = 0; i < out_dim; i++) {
+        float mag = layer->magnitude[i];
+        for (int j = 0; j < in_dim; j++) {
+            int idx = i * in_dim + j;
+            if (mag > 1e-6f)
+                direction[idx] = pretrained_weight[idx] / mag;
+            else
+                direction[idx] = 0.0f;
+        }
+    }
+
+    // Allocate temporary storage for the low-rank contribution.
+    float* temp = (float*)mallocCheck(rank * sizeof(float));
+
+    // Compute the output:
+    //   output = input dot (direction + alpha * (A * B)), then multiplied by magnitude.
+    for (int b = 0; b < out_dim; b++) {
+        float result = 0.0f;
+
+        // Compute temp[r] = (A^T * input)[r]
+        for (int r = 0; r < rank; r++) {
+            temp[r] = 0.0f;
+            for (int a = 0; a < in_dim; a++) {
+                temp[r] += input[a] * layer->A[a * rank + r];
+            }
+        }
+
+        // Add contribution from the normalized directional weights.
+        for (int a = 0; a < in_dim; a++) {
+            result += input[a] * direction[b * in_dim + a];
+        }
+
+        // Add the low-rank update: alpha * (A^T * input)[r] * corresponding B.
+        for (int r = 0; r < rank; r++) {
+            result += layer->alpha * temp[r] * layer->B[r * out_dim + b];
+        }
+
+        // Multiply by the original magnitude.
+        output[b] = result * layer->magnitude[b];
+    }
+
+    free(temp);
+    free(direction);
+}
+
+void dora_backward(float* dinput, float* dmagnitude, float* dA, float* dB,
+                   float* doutput, float* input, DoRALayer* layer, float* pretrained_weight) {
+    // Validate all required pointers
+    if (!layer || !layer->magnitude || !layer->A || !layer->B || !pretrained_weight) {
+        fprintf(stderr, "dora_backward: Invalid pointers passed to function.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    const int in_dim = layer->in_dim;
+    const int out_dim = layer->out_dim;
+    const int rank = layer->rank;
+    const float alpha = layer->alpha;
+
+    // Zero-initialize gradient buffers
+    memset(dmagnitude, 0, out_dim * sizeof(float));
+    memset(dA, 0, in_dim * rank * sizeof(float));
+    memset(dB, 0, rank * out_dim * sizeof(float));
+
+    // Backprop through magnitude scaling
+    for (int o = 0; o < out_dim; o++) {
+        float mag = layer->magnitude[o];
+        if (mag < 1e-6f) mag = 1e-6f;  // Numerical stability
+
+        // Compute direction vector
+        float* direction = (float*)mallocCheck(in_dim * sizeof(float));
+        for (int i = 0; i < in_dim; i++) {
+            direction[i] = pretrained_weight[o * in_dim + i] / mag;
+        }
+
+        // Magnitude gradient
+        dmagnitude[o] = 0.0f;
+        for (int i = 0; i < in_dim; i++) {
+            dmagnitude[o] += doutput[o] * direction[i] * input[i];
+        }
+
+        // Low-rank adaptation gradients
+        for (int r = 0; r < rank; r++) {
+            float a_grad = 0.0f, b_grad = 0.0f;
+            for (int i = 0; i < in_dim; i++) {
+                a_grad += input[i] * layer->B[r * out_dim + o];
+            }
+            for (int i = 0; i < in_dim; i++) {
+                b_grad += layer->A[i * rank + r] * input[i];
+            }
+            dA[r] += alpha * a_grad * doutput[o];
+            dB[r * out_dim + o] += alpha * b_grad * doutput[o];
+        }
+
+        free(direction);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
@@ -530,10 +706,13 @@ typedef struct {
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
+    int use_dora;       // Flag to use DoRA instead of regular fine-tuning
+    int dora_rank;      // Rank for DoRA adaptation
+    float dora_alpha;   // Scaling factor for DoRA
 } GPT2Config;
 
 // the parameters of the model
-#define NUM_PARAMETER_TENSORS 16
+#define NUM_PARAMETER_TENSORS 28
 typedef struct {
     float* wte; // (V, C)
     float* wpe; // (maxT, C)
@@ -551,44 +730,217 @@ typedef struct {
     float* fcprojb; // (L, C)
     float* lnfw; // (C)
     float* lnfb; // (C)
+
+    // DoRA specific parameters
+    float* qkv_magnitude;
+    float* qkv_A;
+    float* qkv_B;
+    float* attproj_magnitude;
+    float* attproj_A;
+    float* attproj_B;
+    float* fc_magnitude;
+    float* fc_A;
+    float* fc_B;
+    float* fcproj_magnitude;
+    float* fcproj_A;
+    float* fcproj_B;
 } ParameterTensors;
 
+// This function computes the sizes of the base (pretrained) parameters.
+// Since our checkpoint file does not include DoRA parameters, we set the sizes
+// for indices 16..27 to zero. Later, we allocate and initialize DoRA parameters separately.
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     size_t Vp = config.padded_vocab_size;
     size_t C = config.channels;
     size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
-    param_sizes[0] = Vp * C; // wte
-    param_sizes[1] = maxT * C; // wpe
-    param_sizes[2] = L * C; // ln1w
-    param_sizes[3] = L * C; // ln1b
-    param_sizes[4] = L * (3 * C) * C; // qkvw
-    param_sizes[5] = L * (3 * C); // qkvb
-    param_sizes[6] = L * C * C; // attprojw
-    param_sizes[7] = L * C; // attprojb
-    param_sizes[8] = L * C; // ln2w
-    param_sizes[9] = L * C; // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = L * C * (4 * C); // fcprojw
-    param_sizes[13] = L * C; // fcprojb
-    param_sizes[14] = C; // lnfw
-    param_sizes[15] = C; // lnfb
+    // Base model parameters (these are read from the checkpoint)
+    param_sizes[0] = Vp * C;           // wte
+    param_sizes[1] = maxT * C;           // wpe
+    param_sizes[2] = L * C;              // ln1w
+    param_sizes[3] = L * C;              // ln1b
+    param_sizes[4] = L * (3 * C) * C;      // qkvw
+    param_sizes[5] = L * (3 * C);          // qkvb
+    param_sizes[6] = L * C * C;            // attprojw
+    param_sizes[7] = L * C;                // attprojb
+    param_sizes[8] = L * C;                // ln2w
+    param_sizes[9] = L * C;                // ln2b
+    param_sizes[10] = L * (4 * C) * C;       // fcw
+    param_sizes[11] = L * (4 * C);           // fcb
+    param_sizes[12] = L * C * (4 * C);       // fcprojw
+    param_sizes[13] = L * C;               // fcprojb
+    param_sizes[14] = C;                   // lnfw
+    param_sizes[15] = C;                   // lnfb
+
+    if (config.use_dora) {
+        size_t L = config.num_layers;
+        size_t rank = config.dora_rank;
+        size_t C = config.channels;
+
+        // DoRA parameter sizes
+        param_sizes[16] = L * 3*C;        // qkv_magnitude
+        param_sizes[17] = L * C*rank;     // qkv_A
+        param_sizes[18] = L * rank*3*C;   // qkv_B
+        param_sizes[19] = L * C;          // attproj_magnitude
+        param_sizes[20] = L * C*rank;     // attproj_A
+        param_sizes[21] = L * rank*C;     // attproj_B
+        param_sizes[22] = L * 4*C;        // fc_magnitude
+        param_sizes[23] = L * C*rank;     // fc_A
+        param_sizes[24] = L * rank*4*C;   // fc_B
+        param_sizes[25] = L * C;          // fcproj_magnitude
+        param_sizes[26] = L * 4*C*rank;   // fcproj_A
+        param_sizes[27] = L * rank*C;     // fcproj_B
+    }
+}
+
+// 2. Optimized Forward Pass with Precomputed Weights
+void matmul_forward_dora(float* out,
+                        const float* inp, const float* weight, const float* bias,
+                        DoRALayer* layer,
+                        int B, int T, int C, int OC) {
+    if (!layer) {
+        matmul_forward(out, inp, weight, bias, B, T, C, OC);
+        return;
+    }
+
+    // Precompute modified weights once
+    float* modified_weights = (float*)malloc(OC * C * sizeof(float));
+    for (int o = 0; o < OC; o++) {
+        float mag = layer->magnitude[o];
+        // Ensure magnitude is not too small
+        if (mag < 1e-6f) mag = 1e-6f;
+
+        for (int i = 0; i < C; i++) {
+            // Compute normalized direction
+            float dir = weight[o*C + i] / mag;
+
+            // Compute LoRA term
+            float lora = 0.0f;
+            for (int r = 0; r < layer->rank; r++) {
+                lora += layer->A[i*layer->rank + r] * layer->B[r*OC + o];
+            }
+
+            // Combine direction and LoRA adaptation, then scale by magnitude
+            modified_weights[o*C + i] = mag * (dir + layer->alpha * lora);
+        }
+    }
+
+    // Use existing matmul with modified weights
+    matmul_forward(out, inp, modified_weights, bias, B, T, C, OC);
+    free(modified_weights);
+}
+
+
+
+// 3. Correct Gradient Accumulation in Backward Pass
+void matmul_backward_dora(float* dinp, float* dweight, float* dbias,
+                         float* dmagnitude, float* dA, float* dB,
+                         const float* dout, const float* inp, const float* weight,
+                         DoRALayer* layer,
+                         int B, int T, int C, int OC) {
+    if (!layer) {
+        matmul_backward(dinp, dweight, dbias, dout, inp, weight, B, T, C, OC);
+        return;
+    }
+
+    const int rank = layer->rank;
+    const float alpha = layer->alpha;
+
+    // Clear gradients for magnitude, A, and B
+    memset(dmagnitude, 0, OC * sizeof(float));
+    memset(dA, 0, C * rank * sizeof(float));
+    memset(dB, 0, rank * OC * sizeof(float));
+
+    // Process each batch and time position
+    #pragma omp parallel for
+    for (int bt = 0; bt < B*T; bt++) {
+        const float* x = inp + bt * C;
+        const float* dout_bt = dout + bt * OC;
+
+        // Thread-local gradient accumulators
+        float* local_dmag = (float*)calloc(OC, sizeof(float));
+        float* local_dA = (float*)calloc(C * rank, sizeof(float));
+        float* local_dB = (float*)calloc(rank * OC, sizeof(float));
+
+        // Compute gradients for each output dimension
+        for (int o = 0; o < OC; o++) {
+            float mag = layer->magnitude[o];
+            if (mag < 1e-6f) mag = 1e-6f; // Numerical stability
+
+            float dL_do = dout_bt[o];
+            const float* weight_row = weight + o * C;
+
+            // Gradient for magnitude
+            float sum_dir = 0.0f;
+            for (int i = 0; i < C; i++) {
+                float dir = weight_row[i] / mag;
+                sum_dir += x[i] * dir;
+            }
+            local_dmag[o] += dL_do * sum_dir;
+
+            // Gradients for low-rank matrices A and B
+            for (int i = 0; i < C; i++) {
+                for (int r = 0; r < rank; r++) {
+                    // Gradient for A[i,r]
+                    local_dA[i * rank + r] += alpha * dL_do * x[i] * layer->B[r * OC + o];
+
+                    // Gradient for B[r,o]
+                    local_dB[r * OC + o] += alpha * dL_do * x[i] * layer->A[i * rank + r];
+                }
+            }
+
+            // Gradient for input
+            for (int i = 0; i < C; i++) {
+                dinp[bt * C + i] += dL_do * weight_row[i];
+            }
+        }
+
+        // Merge thread-local gradients into global gradients
+        #pragma omp critical
+        {
+            for (int o = 0; o < OC; o++) {
+                dmagnitude[o] += local_dmag[o];
+            }
+
+            for (int i = 0; i < C; i++) {
+                for (int r = 0; r < rank; r++) {
+                    dA[i * rank + r] += local_dA[i * rank + r];
+                }
+            }
+
+            for (int r = 0; r < rank; r++) {
+                for (int o = 0; o < OC; o++) {
+                    dB[r * OC + o] += local_dB[r * OC + o];
+                }
+            }
+        }
+
+        free(local_dmag);
+        free(local_dA);
+        free(local_dB);
+    }
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
+#define NUM_PARAMETER_TENSORS 28
+
 float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes) {
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += param_sizes[i];
     }
-    // malloc all parameters all at once
+    // Allocate all parameters at once.
     float* params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
-    // assign all the tensors
+    // Create an array of pointers for all 28 tensors.
     float** ptrs[] = {
-        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
-        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+        &params->wte, &params->wpe, &params->ln1w, &params->ln1b,
+        &params->qkvw, &params->qkvb, &params->attprojw, &params->attprojb,
+        &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
+        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb,
+        &params->qkv_magnitude, &params->qkv_A, &params->qkv_B,
+        &params->attproj_magnitude, &params->attproj_A, &params->attproj_B,
+        &params->fc_magnitude, &params->fc_A, &params->fc_B,
+        &params->fcproj_magnitude, &params->fcproj_A, &params->fcproj_B
     };
     float* params_memory_iterator = params_memory;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -705,51 +1057,115 @@ typedef struct {
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
-
-    // read in model from a checkpoint file
+    // Open the checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
     freadCheck(model_header, sizeof(int), 256, model_file);
-    if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(1); }
+
+    // Validate header
+    if (model_header[0] != 20240326) {
+        printf("Bad magic model file\n");
+        exit(1);
+    }
     if (model_header[1] != 3) {
         printf("Bad version in model file\n");
-        printf("---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(1);
     }
 
-    // read in hyperparameters
-    size_t maxT, V, Vp, L, NH, C; // size_t to prevent int overflow
-    model->config.max_seq_len = maxT = model_header[2];
-    model->config.vocab_size = V = model_header[3];
-    model->config.num_layers = L = model_header[4];
-    model->config.num_heads = NH = model_header[5];
-    model->config.channels = C = model_header[6];
-    model->config.padded_vocab_size = Vp = model_header[7];
+    // Read hyperparameters
+    model->config.max_seq_len = model_header[2];
+    model->config.vocab_size = model_header[3];
+    model->config.num_layers = model_header[4];
+    model->config.num_heads = model_header[5];
+    model->config.channels = model_header[6];
+    model->config.padded_vocab_size = model_header[7];
+    model->config.use_dora = 1;
+    model->config.dora_rank = 8;
+    model->config.dora_alpha = 1.0f;
+
+    // Print config
     printf("[GPT-2]\n");
-    printf("max_seq_len: %zu\n", maxT);
-    printf("vocab_size: %zu\n", V);
-    printf("padded_vocab_size: %zu\n", Vp);
-    printf("num_layers: %zu\n", L);
-    printf("num_heads: %zu\n", NH);
-    printf("channels: %zu\n", C);
+    printf("max_seq_len: %zu\n", model->config.max_seq_len);
+    printf("vocab_size: %zu\n", model->config.vocab_size);
+    printf("padded_vocab_size: %zu\n", model->config.padded_vocab_size);
+    printf("num_layers: %zu\n", model->config.num_layers);
+    printf("num_heads: %zu\n", model->config.num_heads);
+    printf("channels: %zu\n", model->config.channels);
 
-    // allocate space for all the parameters and read them in
-    fill_in_parameter_sizes(model->param_sizes,  model->config);
+    // Compute parameter sizes including DoRA parameters
+    fill_in_parameter_sizes(model->param_sizes, model->config);
 
-    // count the number of parameters
-    size_t num_parameters = 0;
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_parameters += model->param_sizes[i];
-    }
-    printf("num_parameters: %zu\n", num_parameters);
-    model->num_parameters = num_parameters;
-
-    // read in all the parameters from file
+    // Allocate memory for ALL parameters (base + DoRA)
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
-    freadCheck(model->params_memory, sizeof(float), num_parameters, model_file);
+
+    // Read base parameters from checkpoint
+    size_t base_num_parameters = 0;
+    for (int i = 0; i < 16; i++) {
+        base_num_parameters += model->param_sizes[i];
+    }
+    freadCheck(model->params_memory, sizeof(float), base_num_parameters, model_file);
     fcloseCheck(model_file);
 
-    // other inits
+    // Initialize DoRA parameters if enabled
+    if (model->config.use_dora) {
+        const size_t L = model->config.num_layers;
+        const size_t C = model->config.channels;
+        const size_t rank = model->config.dora_rank;
+
+        // Initialize each layer's DoRA components
+        for (size_t l = 0; l < L; l++) {
+            // Query-key-value projection
+            dora_init(&(DoRALayer){
+                .magnitude = &model->params.qkv_magnitude[l * 3*C],
+                .A = &model->params.qkv_A[l * C*rank],
+                .B = &model->params.qkv_B[l * rank*3*C],
+                .rank = rank,
+                .in_dim = C,
+                .out_dim = 3*C
+            }, C, 3*C, rank, model->config.dora_alpha,
+            &model->params.qkvw[l * 3*C*C]);
+
+            // Attention projection
+            dora_init(&(DoRALayer){
+                .magnitude = &model->params.attproj_magnitude[l*C],
+                .A = &model->params.attproj_A[l*C*rank],
+                .B = &model->params.attproj_B[l*rank*C],
+                .rank = rank,
+                .in_dim = C,
+                .out_dim = C
+            }, C, C, rank, model->config.dora_alpha,
+            &model->params.attprojw[l*C*C]);
+
+            // Feed-forward expansion
+            dora_init(&(DoRALayer){
+                .magnitude = &model->params.fc_magnitude[l*4*C],
+                .A = &model->params.fc_A[l*C*rank],
+                .B = &model->params.fc_B[l*rank*4*C],
+                .rank = rank,
+                .in_dim = C,
+                .out_dim = 4*C
+            }, C, 4*C, rank, model->config.dora_alpha,
+            &model->params.fcw[l*4*C*C]);
+
+            // Feed-forward projection
+            dora_init(&(DoRALayer){
+                .magnitude = &model->params.fcproj_magnitude[l*C],
+                .A = &model->params.fcproj_A[l*4*C*rank],
+                .B = &model->params.fcproj_B[l*rank*C],
+                .rank = rank,
+                .in_dim = 4*C,
+                .out_dim = C
+            }, 4*C, C, rank, model->config.dora_alpha,
+            &model->params.fcprojw[l*C*4*C]);
+        }
+    }
+
+    // Initialize remaining pointers
+    model->num_parameters = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        model->num_parameters += model->param_sizes[i];
+    }
+
     model->acts_memory = NULL;
     model->grads_memory = NULL;
     model->m_memory = NULL;
@@ -759,133 +1175,180 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->targets = NULL;
     model->batch_size = 0;
     model->seq_len = 0;
-    model->mean_loss = -1.0f; // -1.0f will designate no loss
+    model->mean_loss = -1.0f;
 }
 
+// --- Forward Pass ---
+// --- Corrected Forward Pass Function ---
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
-    // targets are optional and could be NULL
-
-    // ensure the model was initialized or error out
     if (model->params_memory == NULL) {
-        printf("Error: model was not initialized properly.\n");
+        printf("Error: model not initialized properly.\n");
         exit(1);
     }
 
-    // convenience parameters (size_t to help prevent int overflow)
     size_t V = model->config.vocab_size;
     size_t Vp = model->config.padded_vocab_size;
     size_t L = model->config.num_layers;
     size_t NH = model->config.num_heads;
     size_t C = model->config.channels;
+    int use_dora = model->config.use_dora;
 
-    // validate inputs, all indices must be in the range [0, V)
-    for(int i = 0; i < B * T; i++) {
+    // Validate inputs
+    for (int i = 0; i < B * T; i++) {
         assert(0 <= inputs[i] && inputs[i] < V);
         if (targets != NULL) {
             assert(0 <= targets[i] && targets[i] < V);
         }
     }
 
-    // allocate space for all the activations if needed (done here, lazily)
-    if(model->acts_memory == NULL) {
-        // record the current B,T as well
+    // Lazy allocation of activation memory
+    if (model->acts_memory == NULL) {
         model->batch_size = B;
         model->seq_len = T;
-        // and now allocate the space
         fill_in_activation_sizes(model->act_sizes, model->config, B, T);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
         }
-        printf("num_activations: %zu\n", num_activations);
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
-        // also create memory for caching inputs and targets
         model->inputs = (int*)mallocCheck(B * T * sizeof(int));
-        model->targets = (int*)mallocCheck(B * T * sizeof(int)); // might be unused if we never have targets but it's small
+        model->targets = (int*)mallocCheck(B * T * sizeof(int));
     } else {
-        // validate B,T is consistent with how we've allocated the memory before
-        // in principle we could get more clever here in the future, for now this is safest
         if (B != model->batch_size || T != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)B, (int)T);
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n",
+                   model->batch_size, model->seq_len, (int)B, (int)T);
             exit(EXIT_FAILURE);
         }
     }
 
-    // cache the inputs/targets
+    // Cache inputs/targets
     memcpy(model->inputs, inputs, B * T * sizeof(int));
     if (targets != NULL) {
         memcpy(model->targets, targets, B * T * sizeof(int));
     }
 
-    // forward pass
-    ParameterTensors params = model->params; // for brevity
-    ActivationTensors acts = model->acts;
+    // Forward pass
+    ParameterTensors params = model->params;
+    ActivationTensors acts  = model->acts;
     float* residual;
-    encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C);
+
     for (int l = 0; l < L; l++) {
+        residual = (l == 0) ? acts.encoded : acts.residual3 + (l - 1) * B * T * C;
 
-        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
-
-        // get the pointers of the weights for this layer
-        float* l_ln1w = params.ln1w + l * C;
-        float* l_ln1b = params.ln1b + l * C;
-        float* l_qkvw = params.qkvw + l * 3*C * C;
-        float* l_qkvb = params.qkvb + l * 3*C;
+        // Layer parameters
+        float* l_ln1w     = params.ln1w     + l * C;
+        float* l_ln1b     = params.ln1b     + l * C;
+        float* l_qkvw     = params.qkvw     + l * 3 * C * C;
+        float* l_qkvb     = params.qkvb     + l * 3 * C;
         float* l_attprojw = params.attprojw + l * C * C;
         float* l_attprojb = params.attprojb + l * C;
-        float* l_ln2w = params.ln2w + l * C;
-        float* l_ln2b = params.ln2b + l * C;
-        float* l_fcw = params.fcw + l * 4*C * C;
-        float* l_fcb = params.fcb + l * 4*C;
-        float* l_fcprojw = params.fcprojw + l * C * 4*C;
-        float* l_fcprojb = params.fcprojb + l * C;
+        float* l_ln2w     = params.ln2w     + l * C;
+        float* l_ln2b     = params.ln2b     + l * C;
+        float* l_fcw      = params.fcw      + l * 4 * C * C;
+        float* l_fcb      = params.fcb      + l * 4 * C;
+        float* l_fcprojw  = params.fcprojw  + l * C * 4 * C;
+        float* l_fcprojb  = params.fcprojb  + l * C;
 
-        // get the pointers of the activations for this layer
-        float* l_ln1 = acts.ln1 + l * B * T * C;
-        float* l_ln1_mean = acts.ln1_mean + l * B * T;
-        float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkv = acts.qkv + l * B * T * 3*C;
-        float* l_atty = acts.atty + l * B * T * C;
-        float* l_preatt = acts.preatt + l * B * NH * T * T;
-        float* l_att = acts.att + l * B * NH * T * T;
-        float* l_attproj = acts.attproj + l * B * T * C;
+        // DoRA parameters
+        float* l_qkv_mag     = use_dora ? params.qkv_magnitude     + l * 3 * C : NULL;
+        float* l_qkv_A       = use_dora ? params.qkv_A             + l * C * model->config.dora_rank : NULL;
+        float* l_qkv_B       = use_dora ? params.qkv_B             + l * model->config.dora_rank * 3 * C : NULL;
+        float* l_attproj_mag = use_dora ? params.attproj_magnitude + l * C : NULL;
+        float* l_attproj_A   = use_dora ? params.attproj_A         + l * C * model->config.dora_rank : NULL;
+        float* l_attproj_B   = use_dora ? params.attproj_B         + l * model->config.dora_rank * C : NULL;
+        float* l_fc_mag      = use_dora ? params.fc_magnitude      + l * 4 * C : NULL;
+        float* l_fc_A        = use_dora ? params.fc_A              + l * C * model->config.dora_rank : NULL;
+        float* l_fc_B        = use_dora ? params.fc_B              + l * model->config.dora_rank * 4 * C : NULL;
+        float* l_fcproj_mag  = use_dora ? params.fcproj_magnitude  + l * C : NULL;
+        float* l_fcproj_A    = use_dora ? params.fcproj_A          + l * 4 * C * model->config.dora_rank : NULL;
+        float* l_fcproj_B    = use_dora ? params.fcproj_B          + l * model->config.dora_rank * C : NULL;
+
+        // Layer activations
+        float* l_ln1       = acts.ln1       + l * B * T * C;
+        float* l_ln1_mean  = acts.ln1_mean  + l * B * T;
+        float* l_ln1_rstd  = acts.ln1_rstd  + l * B * T;
+        float* l_qkv       = acts.qkv       + l * B * T * 3 * C;
+        float* l_atty      = acts.atty      + l * B * T * C;
+        float* l_preatt    = acts.preatt    + l * B * NH * T * T;
+        float* l_att       = acts.att       + l * B * NH * T * T;
+        float* l_attproj   = acts.attproj   + l * B * T * C;
         float* l_residual2 = acts.residual2 + l * B * T * C;
-        float* l_ln2 = acts.ln2 + l * B * T * C;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
-        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        float* l_fch = acts.fch + l * B * T * 4*C;
-        float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
-        float* l_fcproj = acts.fcproj + l * B * T * C;
+        float* l_ln2       = acts.ln2       + l * B * T * C;
+        float* l_ln2_mean  = acts.ln2_mean  + l * B * T;
+        float* l_ln2_rstd  = acts.ln2_rstd  + l * B * T;
+        float* l_fch       = acts.fch       + l * B * T * 4 * C;
+        float* l_fch_gelu  = acts.fch_gelu  + l * B * T * 4 * C;
+        float* l_fcproj    = acts.fcproj    + l * B * T * C;
         float* l_residual3 = acts.residual3 + l * B * T * C;
 
-        // now do the forward pass
+        // Forward operations with proper DoRA initialization
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+
+        if (use_dora) {
+            DoRALayer qkv_layer = construct_dora_layer(l_qkv_mag, l_qkv_A, l_qkv_B,
+                                               C, 3*C, model->config.dora_rank, model->config.dora_alpha);
+            matmul_forward_dora(l_qkv, l_ln1, l_qkvw, l_qkvb,
+                                &qkv_layer,
+                                B, T, C, 3*C);
+        } else {
+            matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        }
+
         attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
-        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+
+        if (use_dora) {
+            DoRALayer attproj_layer = construct_dora_layer(l_attproj_mag, l_attproj_A, l_attproj_B,
+                                                  C, C, model->config.dora_rank, model->config.dora_alpha);
+            matmul_forward_dora(l_attproj, l_atty, l_attprojw, l_attprojb,
+                                &attproj_layer,
+                                B, T, C, C);
+        } else {
+            matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        }
+
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+
+        if (use_dora) {
+            DoRALayer fc_layer = construct_dora_layer(l_fc_mag, l_fc_A, l_fc_B,
+                                             C, 4*C, model->config.dora_rank, model->config.dora_alpha);
+            matmul_forward_dora(l_fch, l_ln2, l_fcw, l_fcb,
+                                &fc_layer,
+                                B, T, C, 4*C);
+        } else {
+            matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        }
+
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+
+        if (use_dora) {
+            DoRALayer fcproj_layer = construct_dora_layer(l_fcproj_mag, l_fcproj_A, l_fcproj_B,
+                                                4*C, C, model->config.dora_rank, model->config.dora_alpha);
+            matmul_forward_dora(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb,
+                                &fcproj_layer,
+                                B, T, 4*C, C);
+        } else {
+            matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        }
+
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
-    residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
+
+    residual = acts.residual3 + (L-1)*B*T*C;
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
     matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
     softmax_forward(acts.probs, acts.logits, B, T, V, Vp);
 
-    // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         crossentropy_forward(model->acts.losses, model->acts.probs, targets, B, T, Vp);
-        // for convenience also evaluate the mean loss
         float mean_loss = 0.0f;
-        for (int i=0; i<B*T; i++) { mean_loss += model->acts.losses[i]; }
-        mean_loss /= B*T;
-        model->mean_loss = mean_loss;
+        for (int i = 0; i < B*T; i++) {
+            mean_loss += model->acts.losses[i];
+        }
+        model->mean_loss = mean_loss / (B*T);
     } else {
-        // if we don't have targets, we don't have a loss
         model->mean_loss = -1.0f;
     }
 }
@@ -895,22 +1358,19 @@ void gpt2_zero_grad(GPT2 *model) {
     if(model->grads_acts_memory != NULL) { memset(model->grads_acts_memory, 0, model->num_activations * sizeof(float)); }
 }
 
+// --- Backward Pass ---
 void gpt2_backward(GPT2 *model) {
-
-    // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
         printf("Error: must forward with targets before backward\n");
         exit(1);
     }
 
-    // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes);
         model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, model->act_sizes);
         gpt2_zero_grad(model);
     }
 
-    // convenience shortcuts (and size_t to help prevent int overflow)
     size_t B = model->batch_size;
     size_t T = model->seq_len;
     size_t V = model->config.vocab_size;
@@ -918,117 +1378,303 @@ void gpt2_backward(GPT2 *model) {
     size_t L = model->config.num_layers;
     size_t NH = model->config.num_heads;
     size_t C = model->config.channels;
+    int use_dora = model->config.use_dora;
 
-    // backward pass: go in the reverse order of the forward pass, and call backward() functions
-    ParameterTensors params = model->params; // for brevity
+    ParameterTensors params = model->params;
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
     ActivationTensors grads_acts = model->grads_acts;
 
-    // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
-    // technically this is a small, inline backward() pass of calculating
-    // total, final loss as the mean over all losses over all (B,T) positions in the batch
-    float dloss_mean = 1.0f / (B*T);
-    for (int i = 0; i < B*T; i++) { grads_acts.losses[i] = dloss_mean; }
+    // Initialize the loss gradients (each position gets 1/(B*T))
+    float dloss_mean = 1.0f / (B * T);
+    for (int i = 0; i < B * T; i++) {
+        grads_acts.losses[i] = dloss_mean;
+    }
 
-    crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V, Vp);
-    matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp);
-    float* residual = acts.residual3 + (L-1) * B * T * C; // last layer's residual
-    float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // write to last layer's residual
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+    // Backprop through softmax + cross-entropy
+    crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses,
+                                  acts.probs, model->targets, B, T, V, Vp);
+    // Backprop through final linear: logits = lnf * wte
+    matmul_backward(grads_acts.lnf, grads.wte, NULL,
+                    grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp);
+    // Backprop through final layernorm (lnf)
+    layernorm_backward(grads_acts.encoded, grads.lnfw, grads.lnfb,
+                       grads_acts.lnf, acts.lnf, params.lnfw,
+                       acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
-    for (int l = L-1; l >= 0; l--) {
+    // Now work backwards through the transformer layers
+    for (int l = L - 1; l >= 0; l--) {
+        // The gradient "dresidual" coming from the block above:
+        float* dresidual = (l == 0) ? grads_acts.encoded :
+                           grads_acts.residual3 + (l - 1) * B * T * C;
+        // The forward-pass input to layer l (either encoder output or previous block)
+        float* residual = (l == 0) ? acts.encoded :
+                          acts.residual3 + (l - 1) * B * T * C;
 
-        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
-        dresidual = l == 0 ? grads_acts.encoded : grads_acts.residual3 + (l-1) * B * T * C;
+        // ------------------------------
+        // Get pointers to the activations from the forward pass (for layer l)
+        float* l_ln1       = acts.ln1       + l * B * T * C;
+        float* l_qkv       = acts.qkv       + l * B * T * 3 * C;
+        float* l_atty      = acts.atty      + l * B * T * C;
+        float* l_attproj   = acts.attproj   + l * B * T * C;
+        float* l_residual2 = acts.residual2 + l * B * T * C;
+        float* l_ln2       = acts.ln2       + l * B * T * C;
+        float* l_fch       = acts.fch       + l * B * T * 4 * C;
+        float* l_fch_gelu  = acts.fch_gelu  + l * B * T * 4 * C;
+        float* l_fcproj    = acts.fcproj    + l * B * T * C;
 
-        // get the pointers of the weights for this layer
-        float* l_ln1w = params.ln1w + l * C;
-        float* l_qkvw = params.qkvw + l * 3*C * C;
-        float* l_attprojw = params.attprojw + l * C * C;
-        float* l_ln2w = params.ln2w + l * C;
-        float* l_fcw = params.fcw + l * 4*C * C;
-        float* l_fcprojw = params.fcprojw + l * C * 4*C;
-        // get the pointers of the gradients of the weights for this layer
-        float* dl_ln1w = grads.ln1w + l * C;
-        float* dl_ln1b = grads.ln1b + l * C;
-        float* dl_qkvw = grads.qkvw + l * 3*C * C;
-        float* dl_qkvb = grads.qkvb + l * 3*C;
+        // Get pointers to layer parameters (forward)
+        float* l_ln1w      = params.ln1w      + l * C;
+        float* l_qkvw      = params.qkvw      + l * 3 * C * C;
+        float* l_qkvb      = params.qkvb      + l * 3 * C;
+        float* l_attprojw  = params.attprojw  + l * C * C;
+        float* l_attprojb  = params.attprojb  + l * C;
+        float* l_ln2w      = params.ln2w      + l * C;
+        float* l_ln2b      = params.ln2b      + l * C;
+        float* l_fcw       = params.fcw       + l * 4 * C * C;
+        float* l_fcb       = params.fcb       + l * 4 * C;
+        float* l_fcprojw   = params.fcprojw   + l * C * 4 * C;
+        float* l_fcprojb   = params.fcprojb   + l * C;
+
+        // DoRA parameters (if enabled)
+        float* l_qkv_mag     = use_dora ? params.qkv_magnitude     + l * 3 * C : NULL;
+        float* l_qkv_A       = use_dora ? params.qkv_A             + l * C * model->config.dora_rank : NULL;
+        float* l_qkv_B       = use_dora ? params.qkv_B             + l * model->config.dora_rank * 3 * C : NULL;
+        float* l_attproj_mag = use_dora ? params.attproj_magnitude + l * C : NULL;
+        float* l_attproj_A   = use_dora ? params.attproj_A         + l * C * model->config.dora_rank : NULL;
+        float* l_attproj_B   = use_dora ? params.attproj_B         + l * model->config.dora_rank * C : NULL;
+        float* l_fc_mag      = use_dora ? params.fc_magnitude      + l * 4 * C : NULL;
+        float* l_fc_A        = use_dora ? params.fc_A              + l * C * model->config.dora_rank : NULL;
+        float* l_fc_B        = use_dora ? params.fc_B              + l * model->config.dora_rank * 4 * C : NULL;
+        float* l_fcproj_mag  = use_dora ? params.fcproj_magnitude  + l * C : NULL;
+        float* l_fcproj_A    = use_dora ? params.fcproj_A          + l * 4 * C * model->config.dora_rank : NULL;
+        float* l_fcproj_B    = use_dora ? params.fcproj_B          + l * model->config.dora_rank * C : NULL;
+
+        // ------------------------------
+        // Get pointers to activation gradients for layer l (from grads_acts)
+        float* dl_residual2 = grads_acts.residual2 + l * B * T * C;
+        float* dl_fcproj    = grads_acts.fcproj    + l * B * T * C;
+        float* dl_fch_gelu  = grads_acts.fch_gelu  + l * B * T * 4 * C;
+        float* dl_fch       = grads_acts.fch       + l * B * T * 4 * C;
+        float* dl_ln2       = grads_acts.ln2       + l * B * T * C;
+        float* dl_attproj   = grads_acts.attproj   + l * B * T * C;
+        float* dl_atty      = grads_acts.atty      + l * B * T * C;
+        float* dl_qkv       = grads_acts.qkv       + l * B * T * 3 * C;
+        float* dl_ln1       = grads_acts.ln1       + l * B * T * C;
+        // For attention backward we also need the pre-attention and att gradients:
+        float* dl_preatt    = grads_acts.preatt    + l * B * NH * T * T;
+        float* dl_att       = grads_acts.att       + l * B * NH * T * T;
+
+        // Get pointers to parameter gradients for layer l (from grads)
+        float* dl_ln1w     = grads.ln1w     + l * C;
+        float* dl_ln1b     = grads.ln1b     + l * C;
+        float* dl_qkvw     = grads.qkvw     + l * 3 * C * C;
+        float* dl_qkvb     = grads.qkvb     + l * 3 * C;
         float* dl_attprojw = grads.attprojw + l * C * C;
         float* dl_attprojb = grads.attprojb + l * C;
-        float* dl_ln2w = grads.ln2w + l * C;
-        float* dl_ln2b = grads.ln2b + l * C;
-        float* dl_fcw = grads.fcw + l * 4*C * C;
-        float* dl_fcb = grads.fcb + l * 4*C;
-        float* dl_fcprojw = grads.fcprojw + l * C * 4*C;
-        float* dl_fcprojb = grads.fcprojb + l * C;
-        // get the pointers of the activations for this layer
-        float* l_ln1 = acts.ln1 + l * B * T * C;
-        float* l_ln1_mean = acts.ln1_mean + l * B * T;
-        float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkv = acts.qkv + l * B * T * 3*C;
-        float* l_atty = acts.atty + l * B * T * C;
-        float* l_att = acts.att + l * B * NH * T * T;
-        float* l_residual2 = acts.residual2 + l * B * T * C;
-        float* l_ln2 = acts.ln2 + l * B * T * C;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
-        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        float* l_fch = acts.fch + l * B * T * 4*C;
-        float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
-        // get the pointers of the gradients of the activations for this layer
-        float* dl_ln1 = grads_acts.ln1 + l * B * T * C;
-        float* dl_qkv = grads_acts.qkv + l * B * T * 3*C;
-        float* dl_atty = grads_acts.atty + l * B * T * C;
-        float* dl_preatt = grads_acts.preatt + l * B * NH * T * T;
-        float* dl_att = grads_acts.att + l * B * NH * T * T;
-        float* dl_attproj = grads_acts.attproj + l * B * T * C;
-        float* dl_residual2 = grads_acts.residual2 + l * B * T * C;
-        float* dl_ln2 = grads_acts.ln2 + l * B * T * C;
-        float* dl_fch = grads_acts.fch + l * B * T * 4*C;
-        float* dl_fch_gelu = grads_acts.fch_gelu + l * B * T * 4*C;
-        float* dl_fcproj = grads_acts.fcproj + l * B * T * C;
-        float* dl_residual3 = grads_acts.residual3 + l * B * T * C;
+        float* dl_ln2w     = grads.ln2w     + l * C;
+        float* dl_ln2b     = grads.ln2b     + l * C;
+        float* dl_fcw      = grads.fcw      + l * 4 * C * C;
+        float* dl_fcb      = grads.fcb      + l * 4 * C;
+        float* dl_fcprojw  = grads.fcprojw  + l * C * 4 * C;
+        float* dl_fcprojb  = grads.fcprojb  + l * C;
 
-        // backprop this layer
-        residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
-        matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
-        gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
-        matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
-        layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-        residual_backward(dresidual, dl_attproj, dl_residual2, B*T*C);
-        matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
-        attention_backward(dl_qkv, dl_preatt, dl_att, dl_atty, l_qkv, l_att, B, T, C, NH);
-        matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+        // DoRA parameter gradients (if enabled)
+        float* dl_qkv_mag     = use_dora ? grads.qkv_magnitude     + l * 3 * C : NULL;
+        float* dl_qkv_A       = use_dora ? grads.qkv_A               + l * C * model->config.dora_rank : NULL;
+        float* dl_qkv_B       = use_dora ? grads.qkv_B               + l * model->config.dora_rank * 3 * C : NULL;
+        float* dl_attproj_mag = use_dora ? grads.attproj_magnitude   + l * C : NULL;
+        float* dl_attproj_A   = use_dora ? grads.attproj_A           + l * C * model->config.dora_rank : NULL;
+        float* dl_attproj_B   = use_dora ? grads.attproj_B           + l * model->config.dora_rank * C : NULL;
+        float* dl_fc_mag      = use_dora ? grads.fc_magnitude        + l * 4 * C : NULL;
+        float* dl_fc_A        = use_dora ? grads.fc_A                + l * C * model->config.dora_rank : NULL;
+        float* dl_fc_B        = use_dora ? grads.fc_B                + l * model->config.dora_rank * 4 * C : NULL;
+        float* dl_fcproj_mag  = use_dora ? grads.fcproj_magnitude    + l * C : NULL;
+        float* dl_fcproj_A    = use_dora ? grads.fcproj_A            + l * 4 * C * model->config.dora_rank : NULL;
+        float* dl_fcproj_B    = use_dora ? grads.fcproj_B            + l * model->config.dora_rank * C : NULL;
+
+        // ------------------------------
+        // Backprop through the residual addition that produced residual3:
+        // forward: residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+        residual_backward(dl_residual2, dl_fcproj, dresidual, B * T * C);
+
+        // Backprop through the fcproj linear layer (with DoRA if enabled)
+        if (use_dora) {
+            DoRALayer fcproj_layer = construct_dora_layer(l_fcproj_mag, l_fcproj_A, l_fcproj_B,
+                                                          4 * C, C, model->config.dora_rank, model->config.dora_alpha);
+            matmul_backward_dora(dl_fch_gelu, dl_fcprojw, dl_fcprojb,
+                                 dl_fcproj_mag, dl_fcproj_A, dl_fcproj_B,
+                                 dl_fcproj, l_fch_gelu, l_fcprojw,
+                                 &fcproj_layer, B, T, 4 * C, C);
+        } else {
+            matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb,
+                            dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4 * C, C);
+        }
+
+        // Backprop through GeLU activation
+        gelu_backward(dl_fch, l_fch, dl_fch_gelu, B * T * 4 * C);
+
+        // Backprop through the first FC layer (fcw) with DoRA if enabled:
+        if (use_dora) {
+            DoRALayer fc_layer = construct_dora_layer(l_fc_mag, l_fc_A, l_fc_B,
+                                                      C, 4 * C, model->config.dora_rank, model->config.dora_alpha);
+            matmul_backward_dora(dl_ln2, dl_fcw, dl_fcb,
+                                 dl_fc_mag, dl_fc_A, dl_fc_B,
+                                 dl_fch, l_ln2, l_fcw,
+                                 &fc_layer, B, T, C, 4 * C);
+        } else {
+            matmul_backward(dl_ln2, dl_fcw, dl_fcb,
+                            dl_fch, l_ln2, l_fcw, B, T, C, 4 * C);
+        }
+
+        // Backprop through the layernorm (ln2) applied to residual2:
+        layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2,
+                           l_residual2, l_ln2w,
+                           acts.ln2_mean + l * B * T, acts.ln2_rstd + l * B * T,
+                           B, T, C);
+
+        // Backprop through the residual addition before the attention branch:
+        // forward: residual_forward(l_residual2, residual, l_attproj, B*T*C);
+        residual_backward(dresidual, dl_attproj, dl_residual2, B * T * C);
+
+        // Backprop through the attention projection linear layer with DoRA if enabled:
+        if (use_dora) {
+            DoRALayer attproj_layer = construct_dora_layer(l_attproj_mag, l_attproj_A, l_attproj_B,
+                                                           C, C, model->config.dora_rank, model->config.dora_alpha);
+            matmul_backward_dora(dl_atty, dl_attprojw, dl_attprojb,
+                                 dl_attproj_mag, dl_attproj_A, dl_attproj_B,
+                                 dl_attproj, l_atty, l_attprojw,
+                                 &attproj_layer, B, T, C, C);
+        } else {
+            matmul_backward(dl_atty, dl_attprojw, dl_attprojb,
+                            dl_attproj, l_atty, l_attprojw, B, T, C, C);
+        }
+
+        // Backprop through the attention mechanism.
+        // forward: attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
+        attention_backward(dl_qkv, dl_preatt, dl_att, dl_atty,
+                           l_qkv, acts.att + l * B * NH * T * T, B, T, C, NH);
+
+        // Backprop through the initial linear (qkv) with DoRA if enabled:
+        if (use_dora) {
+            DoRALayer qkv_layer = construct_dora_layer(l_qkv_mag, l_qkv_A, l_qkv_B,
+                                                       C, 3 * C, model->config.dora_rank, model->config.dora_alpha);
+            matmul_backward_dora(dl_ln1, dl_qkvw, dl_qkvb,
+                                  dl_qkv_mag, dl_qkv_A, dl_qkv_B,
+                                  dl_qkv, l_ln1, l_qkvw,
+                                  &qkv_layer, B, T, C, 3 * C);
+        } else {
+            matmul_backward(dl_ln1, dl_qkvw, dl_qkvb,
+                            dl_qkv, l_ln1, l_qkvw, B, T, C, 3 * C);
+        }
+
+        // Finally, backprop through the first layernorm (ln1)
+        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1,
+                           residual, l_ln1w,
+                           acts.ln1_mean + l * B * T, acts.ln1_rstd + l * B * T,
+                           B, T, C);
     }
+
+    // Backprop through the initial encoder embedding layer
     encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C);
 }
 
-void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
-    // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
 
-    // lazily allocate the memory for m_memory and v_memory
-    if (model->m_memory == NULL) {
-        model->m_memory = (float*)calloc(model->num_parameters, sizeof(float));
-        model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
+void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps,
+                float weight_decay, int t) {
+    // Calculate total parameter count including DoRA parameters
+    size_t total_params = model->num_parameters;
+    size_t dora_params_count = 0;
+
+    if (model->config.use_dora) {
+        // Count all DoRA parameters
+        for (int i = 16; i < 28; i++) {
+            dora_params_count += model->param_sizes[i];
+        }
     }
 
+    // Initialize Adam optimizer state if not already done
+    if (model->m_memory == NULL) {
+        // Allocate memory for base parameters
+        model->m_memory = (float*)calloc(model->num_parameters, sizeof(float));
+        model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
+
+        // Allocate additional memory for DoRA parameters if needed
+        if (model->config.use_dora) {
+            // Extend memory for DoRA parameters
+            model->m_memory = (float*)realloc(model->m_memory, (total_params + dora_params_count) * sizeof(float));
+            model->v_memory = (float*)realloc(model->v_memory, (total_params + dora_params_count) * sizeof(float));
+
+            // Initialize the new memory to zero
+            memset(model->m_memory + total_params, 0, dora_params_count * sizeof(float));
+            memset(model->v_memory + total_params, 0, dora_params_count * sizeof(float));
+        }
+    }
+
+    // Update base parameters
     for (size_t i = 0; i < model->num_parameters; i++) {
         float param = model->params_memory[i];
         float grad = model->grads_memory[i];
 
-        // update the first moment (momentum)
+        // AdamW update
         float m = beta1 * model->m_memory[i] + (1.0f - beta1) * grad;
-        // update the second moment (RMSprop)
         float v = beta2 * model->v_memory[i] + (1.0f - beta2) * grad * grad;
-        // bias-correct both moments
         float m_hat = m / (1.0f - powf(beta1, t));
         float v_hat = v / (1.0f - powf(beta2, t));
 
-        // update
         model->m_memory[i] = m;
         model->v_memory[i] = v;
         model->params_memory[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
+    }
+
+    // Update DoRA parameters if enabled
+    if (model->config.use_dora) {
+        // Define arrays of DoRA parameter pointers and their gradient pointers
+        float* dora_params[] = {
+            model->params.qkv_magnitude, model->params.qkv_A, model->params.qkv_B,
+            model->params.attproj_magnitude, model->params.attproj_A, model->params.attproj_B,
+            model->params.fc_magnitude, model->params.fc_A, model->params.fc_B,
+            model->params.fcproj_magnitude, model->params.fcproj_A, model->params.fcproj_B
+        };
+
+        float* dora_grads[] = {
+            model->grads.qkv_magnitude, model->grads.qkv_A, model->grads.qkv_B,
+            model->grads.attproj_magnitude, model->grads.attproj_A, model->grads.attproj_B,
+            model->grads.fc_magnitude, model->grads.fc_A, model->grads.fc_B,
+            model->grads.fcproj_magnitude, model->grads.fcproj_A, model->grads.fcproj_B
+        };
+
+        // Iterate through each DoRA parameter type
+        size_t m_offset = model->num_parameters; // Start after base parameters
+
+        for (int i = 0; i < 12; i++) {
+            size_t param_size = model->param_sizes[i + 16]; // DoRA params start at index 16
+
+            if (param_size == 0) continue; // Skip if this DoRA parameter isn't used
+
+            // Apply AdamW updates to each parameter in this DoRA component
+            for (size_t j = 0; j < param_size; j++) {
+                float param = dora_params[i][j];
+                float grad = dora_grads[i][j];
+
+                // AdamW update
+                float m = beta1 * model->m_memory[m_offset] + (1.0f - beta1) * grad;
+                float v = beta2 * model->v_memory[m_offset] + (1.0f - beta2) * grad * grad;
+                float m_hat = m / (1.0f - powf(beta1, t));
+                float v_hat = v / (1.0f - powf(beta2, t));
+
+                model->m_memory[m_offset] = m;
+                model->v_memory[m_offset] = v;
+
+                // Apply lower weight decay to DoRA parameters (optional)
+                float dora_weight_decay = weight_decay * 0.1f; // Reduced weight decay for DoRA
+
+                // Update the parameter
+                dora_params[i][j] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + dora_weight_decay * param);
+
+                m_offset++;
+            }
+        }
     }
 }
 
