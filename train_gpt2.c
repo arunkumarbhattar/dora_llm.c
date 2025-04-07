@@ -52,43 +52,28 @@ DoRALayer construct_dora_layer(float* magnitude, float* A, float* B,
 }
 
 void dora_init(DoRALayer* layer, int in_dim, int out_dim, int rank, float alpha, float* pretrained_weight) {
-    layer->in_dim = in_dim;
-    layer->out_dim = out_dim;
-    layer->rank = rank;
-
-    // Don't allocate new memory - use the pointers already in the structure
-    // layer->magnitude should already point to allocated memory
-
-    // Calculate the norm (magnitude) for each output dimension
+    // Initialize magnitude with L2 norm + epsilon
     for (int i = 0; i < out_dim; i++) {
-        float sum_squared = 0.0f;
+        float sum_sq = 1e-6f;  // Start with epsilon
         for (int j = 0; j < in_dim; j++) {
             float val = pretrained_weight[i * in_dim + j];
-            sum_squared += val * val;
+            sum_sq += val * val;
         }
-
-        layer->magnitude[i] = sqrtf(sum_squared);
-        // Ensure magnitude is not too small to prevent division by zero
-        if (layer->magnitude[i] < 1e-6f) {
-            layer->magnitude[i] = 1e-6f;
-        }
+        layer->magnitude[i] = sqrtf(sum_sq);
     }
 
-    // Initialize A and B with small random values
-    float std_dev = 1.0f / sqrtf(rank);
-    for (int i = 0; i < in_dim; i++) {
-        for (int r = 0; r < rank; r++) {
-            layer->A[i * rank + r] = (2.0f * ((float)rand() / RAND_MAX) - 1.0f) * std_dev;
-        }
+    // He initialization for low-rank matrices
+    float std_dev = sqrtf(2.0f / (in_dim + rank));
+    for (int i = 0; i < in_dim * rank; i++) {
+        layer->A[i] = ((float)rand()/RAND_MAX - 0.5f) * 2.0f * std_dev;
     }
 
-    for (int r = 0; r < rank; r++) {
-        for (int o = 0; o < out_dim; o++) {
-            layer->B[r * out_dim + o] = (2.0f * ((float)rand() / RAND_MAX) - 1.0f) * std_dev;
-        }
+    std_dev = sqrtf(2.0f / (rank + out_dim));
+    for (int i = 0; i < rank * out_dim; i++) {
+        layer->B[i] = ((float)rand()/RAND_MAX - 0.5f) * 2.0f * std_dev;
     }
 
-    // Scale alpha by 1/sqrt(rank) for stability
+    // Scale alpha by 1/sqrt(rank)
     layer->alpha = alpha / sqrtf(rank);
 }
 
@@ -805,27 +790,23 @@ void matmul_forward_dora(float* out,
 
     // Precompute modified weights once
     float* modified_weights = (float*)malloc(OC * C * sizeof(float));
+    const float eps = 1e-6f;
+
+    #pragma omp parallel for collapse(2)
     for (int o = 0; o < OC; o++) {
-        float mag = layer->magnitude[o];
-        // Ensure magnitude is not too small
-        if (mag < 1e-6f) mag = 1e-6f;
-
         for (int i = 0; i < C; i++) {
-            // Compute normalized direction
+            float mag = fmaxf(layer->magnitude[o], eps);
             float dir = weight[o*C + i] / mag;
-
-            // Compute LoRA term
             float lora = 0.0f;
+
+            // Low-rank decomposition
             for (int r = 0; r < layer->rank; r++) {
                 lora += layer->A[i*layer->rank + r] * layer->B[r*OC + o];
             }
-
-            // Combine direction and LoRA adaptation, then scale by magnitude
             modified_weights[o*C + i] = mag * (dir + layer->alpha * lora);
         }
     }
 
-    // Use existing matmul with modified weights
     matmul_forward(out, inp, modified_weights, bias, B, T, C, OC);
     free(modified_weights);
 }
@@ -845,81 +826,45 @@ void matmul_backward_dora(float* dinp, float* dweight, float* dbias,
 
     const int rank = layer->rank;
     const float alpha = layer->alpha;
+    const float eps = 1e-6f;
 
-    // Clear gradients for magnitude, A, and B
-    memset(dmagnitude, 0, OC * sizeof(float));
-    memset(dA, 0, C * rank * sizeof(float));
-    memset(dB, 0, rank * OC * sizeof(float));
-
-    // Process each batch and time position
-    #pragma omp parallel for
+    // Initialize gradients through OpenMP reduction
+#pragma omp parallel for reduction(+:dmagnitude[:OC], dA[:C*rank], dB[:rank*OC])
     for (int bt = 0; bt < B*T; bt++) {
         const float* x = inp + bt * C;
         const float* dout_bt = dout + bt * OC;
 
-        // Thread-local gradient accumulators
-        float* local_dmag = (float*)calloc(OC, sizeof(float));
-        float* local_dA = (float*)calloc(C * rank, sizeof(float));
-        float* local_dB = (float*)calloc(rank * OC, sizeof(float));
-
-        // Compute gradients for each output dimension
         for (int o = 0; o < OC; o++) {
-            float mag = layer->magnitude[o];
-            if (mag < 1e-6f) mag = 1e-6f; // Numerical stability
-
+            float mag = fmaxf(layer->magnitude[o], eps);
             float dL_do = dout_bt[o];
             const float* weight_row = weight + o * C;
 
-            // Gradient for magnitude
+            // Magnitude gradient
             float sum_dir = 0.0f;
             for (int i = 0; i < C; i++) {
-                float dir = weight_row[i] / mag;
-                sum_dir += x[i] * dir;
+                sum_dir += x[i] * (weight_row[i] / mag);
             }
-            local_dmag[o] += dL_do * sum_dir;
+            dmagnitude[o] += dL_do * sum_dir;
 
-            // Gradients for low-rank matrices A and B
-            for (int i = 0; i < C; i++) {
-                for (int r = 0; r < rank; r++) {
-                    // Gradient for A[i,r]
-                    local_dA[i * rank + r] += alpha * dL_do * x[i] * layer->B[r * OC + o];
-
-                    // Gradient for B[r,o]
-                    local_dB[r * OC + o] += alpha * dL_do * x[i] * layer->A[i * rank + r];
+            // Low-rank gradients
+            for (int r = 0; r < rank; r++) {
+                float a_grad = 0.0f, b_grad = 0.0f;
+                for (int i = 0; i < C; i++) {
+                    a_grad += x[i] * layer->B[r * OC + o];
+                    b_grad += layer->A[i * rank + r] * x[i];
                 }
+                dA[o * rank + r] += alpha * dL_do * a_grad / mag;
+                dB[r * OC + o] += alpha * dL_do * b_grad / mag;
             }
 
-            // Gradient for input
+            // Input gradient
             for (int i = 0; i < C; i++) {
                 dinp[bt * C + i] += dL_do * weight_row[i];
             }
         }
-
-        // Merge thread-local gradients into global gradients
-        #pragma omp critical
-        {
-            for (int o = 0; o < OC; o++) {
-                dmagnitude[o] += local_dmag[o];
-            }
-
-            for (int i = 0; i < C; i++) {
-                for (int r = 0; r < rank; r++) {
-                    dA[i * rank + r] += local_dA[i * rank + r];
-                }
-            }
-
-            for (int r = 0; r < rank; r++) {
-                for (int o = 0; o < OC; o++) {
-                    dB[r * OC + o] += local_dB[r * OC + o];
-                }
-            }
-        }
-
-        free(local_dmag);
-        free(local_dA);
-        free(local_dB);
     }
 }
+
 
 // allocate memory for the parameters and point the individual tensors to the right places
 #define NUM_PARAMETER_TENSORS 28
@@ -1612,6 +1557,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     }
 
     // Update base parameters
+    #pragma omp parallel for
     for (size_t i = 0; i < model->num_parameters; i++) {
         float param = model->params_memory[i];
         float grad = model->grads_memory[i];
