@@ -52,17 +52,17 @@ DoRALayer construct_dora_layer(float* magnitude, float* A, float* B,
 }
 
 void dora_init(DoRALayer* layer, int in_dim, int out_dim, int rank, float alpha, float* pretrained_weight) {
-    // Initialize magnitude with L2 norm + epsilon
+    // Initialize magnitude with proper scaling
+    float eps = 1e-6f;
     for (int i = 0; i < out_dim; i++) {
-        float sum_sq = 1e-6f;  // Start with epsilon
+        float sum_sq = eps;
         for (int j = 0; j < in_dim; j++) {
-            float val = pretrained_weight[i * in_dim + j];
-            sum_sq += val * val;
+            sum_sq += pretrained_weight[i * in_dim + j] * pretrained_weight[i * in_dim + j];
         }
-        layer->magnitude[i] = sqrtf(sum_sq);
+        layer->magnitude[i] = sqrtf(sum_sq) / sqrtf(in_dim);  // Scale by 1/sqrt(dim)
     }
 
-    // He initialization for low-rank matrices
+    // He initialization with rank scaling
     float std_dev = sqrtf(2.0f / (in_dim + rank));
     for (int i = 0; i < in_dim * rank; i++) {
         layer->A[i] = ((float)rand()/RAND_MAX - 0.5f) * 2.0f * std_dev;
@@ -73,8 +73,7 @@ void dora_init(DoRALayer* layer, int in_dim, int out_dim, int rank, float alpha,
         layer->B[i] = ((float)rand()/RAND_MAX - 0.5f) * 2.0f * std_dev;
     }
 
-    // Scale alpha by 1/sqrt(rank)
-    layer->alpha = alpha / sqrtf(rank);
+    layer->alpha = alpha / sqrtf(rank);  // Scale alpha by 1/sqrt(rank)
 }
 
 void dora_forward(float* output, float* input, DoRALayer* layer, float* pretrained_weight) {
@@ -792,14 +791,13 @@ void matmul_forward_dora(float* out,
     float* modified_weights = (float*)malloc(OC * C * sizeof(float));
     const float eps = 1e-6f;
 
-    #pragma omp parallel for collapse(2)
+#pragma omp parallel for collapse(2)
     for (int o = 0; o < OC; o++) {
         for (int i = 0; i < C; i++) {
             float mag = fmaxf(layer->magnitude[o], eps);
             float dir = weight[o*C + i] / mag;
             float lora = 0.0f;
 
-            // Low-rank decomposition
             for (int r = 0; r < layer->rank; r++) {
                 lora += layer->A[i*layer->rank + r] * layer->B[r*OC + o];
             }
@@ -810,7 +808,6 @@ void matmul_forward_dora(float* out,
     matmul_forward(out, inp, modified_weights, bias, B, T, C, OC);
     free(modified_weights);
 }
-
 
 
 // 3. Correct Gradient Accumulation in Backward Pass
@@ -1527,38 +1524,41 @@ void gpt2_backward(GPT2 *model) {
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps,
                 float weight_decay, int t) {
-    // Calculate total parameter count including DoRA parameters
-    size_t total_params = model->num_parameters;
-    size_t dora_params_count = 0;
-
-    if (model->config.use_dora) {
-        // Count all DoRA parameters
-        for (int i = 16; i < 28; i++) {
-            dora_params_count += model->param_sizes[i];
-        }
-    }
+    // Unified parameter handling including DoRA parameters
+    const size_t total_params = model->num_parameters;
 
     // Initialize Adam optimizer state if not already done
     if (model->m_memory == NULL) {
-        // Allocate memory for base parameters
-        model->m_memory = (float*)calloc(model->num_parameters, sizeof(float));
-        model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
+        model->m_memory = (float*)calloc(total_params, sizeof(float));
+        model->v_memory = (float*)calloc(total_params, sizeof(float));
+    }
 
-        // Allocate additional memory for DoRA parameters if needed
-        if (model->config.use_dora) {
-            // Extend memory for DoRA parameters
-            model->m_memory = (float*)realloc(model->m_memory, (total_params + dora_params_count) * sizeof(float));
-            model->v_memory = (float*)realloc(model->v_memory, (total_params + dora_params_count) * sizeof(float));
+    // Gradient clipping (added for stability)
+    float grad_norm = 0.0f;
+    #pragma omp parallel for reduction(+:grad_norm)
+    for (size_t i = 0; i < total_params; i++) {
+        float g = model->grads_memory[i];
+        grad_norm += g * g;
+    }
+    grad_norm = sqrtf(grad_norm);
+    const float clip_threshold = 1.0f;
 
-            // Initialize the new memory to zero
-            memset(model->m_memory + total_params, 0, dora_params_count * sizeof(float));
-            memset(model->v_memory + total_params, 0, dora_params_count * sizeof(float));
+    if (grad_norm > clip_threshold) {
+        const float scale = clip_threshold / (grad_norm + 1e-6f);
+        #pragma omp parallel for
+        for (size_t i = 0; i < total_params; i++) {
+            model->grads_memory[i] *= scale;
         }
     }
 
-    // Update base parameters
+    // Learning rate warmup
+    const float warmup_steps = 1000.0f;
+    const float lr_scale = fminf(1.0f, (float)t / warmup_steps);
+    const float effective_lr = learning_rate * lr_scale;
+
+    // Unified parameter update (base + DoRA)
     #pragma omp parallel for
-    for (size_t i = 0; i < model->num_parameters; i++) {
+    for (size_t i = 0; i < total_params; i++) {
         float param = model->params_memory[i];
         float grad = model->grads_memory[i];
 
@@ -1570,57 +1570,19 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 
         model->m_memory[i] = m;
         model->v_memory[i] = v;
-        model->params_memory[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
-    }
 
-    // Update DoRA parameters if enabled
-    if (model->config.use_dora) {
-        // Define arrays of DoRA parameter pointers and their gradient pointers
-        float* dora_params[] = {
-            model->params.qkv_magnitude, model->params.qkv_A, model->params.qkv_B,
-            model->params.attproj_magnitude, model->params.attproj_A, model->params.attproj_B,
-            model->params.fc_magnitude, model->params.fc_A, model->params.fc_B,
-            model->params.fcproj_magnitude, model->params.fcproj_A, model->params.fcproj_B
-        };
+        // Apply weight decay only to base parameters (first 16 tensors)
+        int is_dora_param = (i >= model->param_sizes[0] + model->param_sizes[1] +
+                            model->param_sizes[2] + model->param_sizes[3] +
+                            model->param_sizes[4] + model->param_sizes[5] +
+                            model->param_sizes[6] + model->param_sizes[7] +
+                            model->param_sizes[8] + model->param_sizes[9] +
+                            model->param_sizes[10] + model->param_sizes[11] +
+                            model->param_sizes[12] + model->param_sizes[13] +
+                            model->param_sizes[14] + model->param_sizes[15]);
 
-        float* dora_grads[] = {
-            model->grads.qkv_magnitude, model->grads.qkv_A, model->grads.qkv_B,
-            model->grads.attproj_magnitude, model->grads.attproj_A, model->grads.attproj_B,
-            model->grads.fc_magnitude, model->grads.fc_A, model->grads.fc_B,
-            model->grads.fcproj_magnitude, model->grads.fcproj_A, model->grads.fcproj_B
-        };
-
-        // Iterate through each DoRA parameter type
-        size_t m_offset = model->num_parameters; // Start after base parameters
-
-        for (int i = 0; i < 12; i++) {
-            size_t param_size = model->param_sizes[i + 16]; // DoRA params start at index 16
-
-            if (param_size == 0) continue; // Skip if this DoRA parameter isn't used
-
-            // Apply AdamW updates to each parameter in this DoRA component
-            for (size_t j = 0; j < param_size; j++) {
-                float param = dora_params[i][j];
-                float grad = dora_grads[i][j];
-
-                // AdamW update
-                float m = beta1 * model->m_memory[m_offset] + (1.0f - beta1) * grad;
-                float v = beta2 * model->v_memory[m_offset] + (1.0f - beta2) * grad * grad;
-                float m_hat = m / (1.0f - powf(beta1, t));
-                float v_hat = v / (1.0f - powf(beta2, t));
-
-                model->m_memory[m_offset] = m;
-                model->v_memory[m_offset] = v;
-
-                // Apply lower weight decay to DoRA parameters (optional)
-                float dora_weight_decay = weight_decay * 0.1f; // Reduced weight decay for DoRA
-
-                // Update the parameter
-                dora_params[i][j] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + dora_weight_decay * param);
-
-                m_offset++;
-            }
-        }
+        float decay = is_dora_param ? weight_decay * 0.1f : weight_decay;
+        model->params_memory[i] -= effective_lr * (m_hat / (sqrtf(v_hat) + eps) + decay * param);
     }
 }
 
